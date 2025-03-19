@@ -1,120 +1,153 @@
-const {moviesDb,ratingsDb} = require('../db');
+const Movie = require('../models/movie');
+const Rating = require('../models/ratings');
+const { Op, fn, col } = require('sequelize');
+
 const ITEMS_PER_PAGE = 50;
 
-// Helper function to format budget in dollars
+// Helper: format budget as a dollar string
 function formatBudget(budget) {
-  if (budget === null || budget === undefined) return null;
-  // Assuming budget is stored in integer dollars; format with a dollar sign and commas
+  if (!budget && budget !== 0) return null;
   return `$${Number(budget).toLocaleString()}`;
 }
 
-// List all movies (paginated)
-const getAllMovies = (page = 1) => {
+/**
+ * List all movies, paginated
+ */
+async function getAllMovies(page = 1) {
   const offset = (page - 1) * ITEMS_PER_PAGE;
-  const query = `
-    SELECT imdbid,movieId, title, genres, releaseDate, budget
-    FROM movies
-    LIMIT ? OFFSET ?;
-  `;
-  return new Promise((resolve, reject) => {
-    moviesDb.all(query, [ITEMS_PER_PAGE, offset], (err, rows) => {
-      if (err) {
-        return reject(err);
-      }
-      const formattedRows = rows.map(row => ({
-        ...row,
-        budget: formatBudget(row.budget)
-      }));
-      resolve(formattedRows);
-    });
-  });
-};
 
-// Get movie details including average rating from the ratings table
-const getMovieDetails = (id) => {
-  const movieQuery = `
-    SELECT imdbid, movieid, title, overview, releaseDate, budget, runtime, genres, language, productionCompanies
-    FROM movies
-    WHERE movieid = ?;
-  `;
-  return new Promise((resolve, reject) => {
-    moviesDb.get(movieQuery, [id], (err, movie) => {
-      if (err) {
-        return reject(err);
-      }
-      if (!movie) {
-        return resolve(null);
-      }
-      movie.budget = formatBudget(movie.budget);
-      
-      // Retrieve average rating from the ratings table
-      const ratingQuery = `
-        SELECT AVG(rating) as average_rating
-        FROM ratings
-        WHERE movieid = ?;
-      `;
-      ratingsDb.get(ratingQuery, [movie.movieId], (err, ratingResult) => {
-        if (err) {
-          return reject(err);
-        }
-        movie.average_rating = ratingResult ? ratingResult.average_rating : null;
-        resolve(movie);
-      });
-    });
+  const { rows, count } = await Movie.findAndCountAll({
+    attributes: ['movieId', 'imdbId', 'title', 'genres', 'releaseDate', 'budget'],
+    limit: ITEMS_PER_PAGE,
+    offset,
   });
-};
 
-// Get movies for a given year, sorted by release_date (asc or desc)
-const getMoviesByYear = (year, page = 1, sort = 'asc') => {
+  const formattedRows = rows.map((movie) => ({
+    movieId: movie.movieId,
+    imdbId: movie.imdbId,
+    title: movie.title,
+    genres: movie.genres,
+    releaseDate: movie.releaseDate,
+    budget: formatBudget(movie.budget),
+  }));
+
+  return {
+    data: formattedRows,
+    currentPage: page,
+    totalPages: Math.ceil(count / ITEMS_PER_PAGE),
+  };
+}
+
+/**
+ * Movie details including average rating
+ */
+async function getMovieDetails(movieId) {
+  // 1) Fetch the movie from the movies DB
+  const movie = await Movie.findOne({
+    where: { movieId },
+  });
+
+  if (!movie) return null;
+
+  // 2) Format the budget
+  const details = {
+    movieId: movie.movieId,
+    imdbId: movie.imdbId,
+    title: movie.title,
+    overview: movie.overview,
+    releaseDate: movie.releaseDate,
+    budget: formatBudget(movie.budget),
+    runtime: movie.runtime,
+    language: movie.language,
+    genres: movie.genres,
+    productionCompanies: movie.productionCompanies,
+    revenue: movie.revenue,
+    status: movie.status,
+  };
+
+  // 3) Calculate the average rating from the ratings DB
+  const avgRating = await Rating.findOne({
+    attributes: [[fn('AVG', col('rating')), 'averageRating']],
+    where: { movieId: movie.movieId },
+  });
+
+  // If we got a result, attach averageRating
+  details.averageRating = avgRating?.dataValues?.averageRating || null;
+
+  return details;
+}
+
+/**
+ * Movies by year, paginated, with optional ascending/descending sort
+ */
+async function getMoviesByYear(year, page = 1, sort = 'asc') {
   const offset = (page - 1) * ITEMS_PER_PAGE;
-  // Filter movies by release year assuming release_date is stored as YYYY-MM-DD
-  const query = `
-    SELECT imdbid, title, genres, releaseDate, budget
-    FROM movies
-    WHERE strftime('%Y', releaseDate) = ?
-    ORDER BY releaseDate ${sort.toUpperCase() === 'DESC' ? 'DESC' : 'ASC'}
-    LIMIT ? OFFSET ?;
-  `;
-  return new Promise((resolve, reject) => {
-    moviesDb.all(query, [year, ITEMS_PER_PAGE, offset], (err, rows) => {
-      if (err) {
-        return reject(err);
-      }
-      const formattedRows = rows.map(row => ({
-        ...row,
-        budget: formatBudget(row.budget)
-      }));
-      resolve(formattedRows);
-    });
-  });
-};
 
-// Get movies by genre 
-const getMoviesByGenre = (genre, page = 1) => {
-  const offset = (page - 1) * ITEMS_PER_PAGE;
-  const query = `
-    SELECT imdbid, title, genres, releaseDate, budget
-    FROM movies
-    WHERE genres LIKE ?
-    LIMIT ? OFFSET ?;
-  `;
-  return new Promise((resolve, reject) => {
-    moviesDb.all(query, [`%${genre}%`, ITEMS_PER_PAGE, offset], (err, rows) => {
-      if (err) {
-        return reject(err);
-      }
-      const formattedRows = rows.map(row => ({
-        ...row,
-        budget: formatBudget(row.budget)
-      }));
-      resolve(formattedRows);
-    });
+  // If releaseDate is stored as YYYY-MM-DD, we can filter by year using LIKE
+  const { rows, count } = await Movie.findAndCountAll({
+    attributes: ['movieId', 'imdbId', 'title', 'genres', 'releaseDate', 'budget'],
+    where: {
+      releaseDate: {
+        [Op.like]: `${year}-%-%`,
+      },
+    },
+    order: [['releaseDate', sort.toUpperCase() === 'DESC' ? 'DESC' : 'ASC']],
+    limit: ITEMS_PER_PAGE,
+    offset,
   });
-};
+
+  const formattedRows = rows.map((movie) => ({
+    movieId: movie.movieId,
+    imdbId: movie.imdbId,
+    title: movie.title,
+    genres: movie.genres,
+    releaseDate: movie.releaseDate,
+    budget: formatBudget(movie.budget),
+  }));
+
+  return {
+    data: formattedRows,
+    currentPage: page,
+    totalPages: Math.ceil(count / ITEMS_PER_PAGE),
+  };
+}
+
+/**
+ * Movies by genre, paginated
+ */
+async function getMoviesByGenre(genre, page = 1) {
+  const offset = (page - 1) * ITEMS_PER_PAGE;
+
+  const { rows, count } = await Movie.findAndCountAll({
+    attributes: ['movieId', 'imdbId', 'title', 'genres', 'releaseDate', 'budget'],
+    where: {
+      genres: {
+        [Op.like]: `%${genre}%`,
+      },
+    },
+    limit: ITEMS_PER_PAGE,
+    offset,
+  });
+
+  const formattedRows = rows.map((movie) => ({
+    movieId: movie.movieId,
+    imdbId: movie.imdbId,
+    title: movie.title,
+    genres: movie.genres,
+    releaseDate: movie.releaseDate,
+    budget: formatBudget(movie.budget),
+  }));
+
+  return {
+    data: formattedRows,
+    currentPage: page,
+    totalPages: Math.ceil(count / ITEMS_PER_PAGE),
+  };
+}
 
 module.exports = {
   getAllMovies,
   getMovieDetails,
   getMoviesByYear,
-  getMoviesByGenre
+  getMoviesByGenre,
 };
